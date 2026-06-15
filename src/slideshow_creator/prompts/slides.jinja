@@ -1,0 +1,41 @@
+You are a presentation designer. From the research content below, design a clear,
+well-paced slide deck as a JSON array of typed slides.
+{% if instructions %}
+Additional instructions from the user (follow these closely):
+{{ instructions }}
+{% endif %}
+
+Aim for about {{ num_slides }} slides. Open with a "title" slide and use "section"
+slides as dividers between major parts. Each slide is an object with a "type":
+
+- "title":      the opening slide. Fields: "title", optional "subtitle".
+- "section":    a divider/section header. Fields: "title".
+- "bullets":    a few concise bullet points. Fields: "title", "bullets" (array of short strings), optional "notes" (speaker notes).
+- "image_text": a short explanatory slide. Fields: "title", optional "body" (a sentence or two), optional "bullets", optional "notes".
+- "chart":      a data chart. Fields: "title", optional "caption", and "spec" — an AntV Infographic DSL string using a chart-* template.
+- "infographic":a visual infographic. Fields: "title", optional "caption", and "spec" — an AntV Infographic DSL string using a NON-chart template.
+
+Guidelines:
+- Keep text on slides short and punchy — phrases, not paragraphs.
+- Use "chart" slides for quantitative comparisons/trends; use "infographic" slides for
+  processes, lists, comparisons, hierarchies. Use data slides where they genuinely help.
+- "chart" specs MUST use a chart-* template; "infographic" specs MUST use a non-chart template.
+- Write in the same language as the research content.
+
+The AntV Infographic DSL for "chart"/"infographic" slide specs:
+
+{{ antv_syntax }}
+
+Return ONLY valid JSON (no prose, no markdown fences) matching exactly:
+{
+  "title": "Deck title",
+  "subtitle": "Optional one-line subtitle",
+  "slides": [
+    { "type": "title", "title": "...", "subtitle": "..." },
+    { "type": "bullets", "title": "...", "bullets": ["...", "..."] },
+    { "type": "chart", "title": "...", "caption": "...", "spec": "infographic chart-column-simple\ndata\n  ..." }
+  ]
+}
+
+Research content:
+{{ content }}

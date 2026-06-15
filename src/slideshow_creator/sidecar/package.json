@@ -1,0 +1,11 @@
+{
+  "name": "slideshow-creator-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AntV Infographic SSR + SVG->PNG rasterizer for slideshow-creator data slides.",
+  "dependencies": {
+    "@antv/infographic": "0.2.19",
+    "sharp": "^0.34.5"
+  }
+}
