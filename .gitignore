@@ -7,3 +7,4 @@ build/
 .pytest_cache/
 .ruff_cache/
 src/slideshow_creator/sidecar/node_modules/
+.DS_Store
