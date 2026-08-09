@@ -260,6 +260,10 @@ class SlideshowCreator(BaseCreator):
                 )
             ],
             icon="presentation",
+            suggestion_hint=(
+                "the narrative arc across the deck, what each section should cover, "
+                "and which points deserve their own slide"
+            ),
         )
 
     async def generate(self, request: CreationRequest) -> CreationResult:
