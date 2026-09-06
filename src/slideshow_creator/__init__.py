@@ -15,7 +15,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import ClassVar, List, Literal
+from typing import ClassVar, List, Literal, Tuple
 
 from ai_prompter import Prompter
 from loguru import logger
@@ -27,13 +27,15 @@ from open_notebook_creator_sdk import (
     CreationResult,
     CreatorManifest,
     ModelRoleSpec,
+    RenderRequest,
+    SourceDoc,
 )
 from open_notebook_creator_sdk.schemas import SlideshowV1
 from pydantic import BaseModel, Field
 
 from .sanitize import sanitize_markdown
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _PKG_DIR = Path(__file__).resolve().parent
 _PROMPTS_DIR = _PKG_DIR / "prompts"
@@ -41,6 +43,11 @@ _SIDECAR_DIR = _PKG_DIR / "sidecar"
 
 _QMD_NAME = "slideshow.qmd"
 _QMD_STEM = "slideshow"
+_ASSETS_DIR = "assets"
+
+# Pre-rendered visuals the .qmd references by relative path. Both travel with the
+# artifact as role="asset": the SVG feeds reveal.js, the PNG feeds pptx/beamer.
+_ASSET_TYPES: dict[str, str] = {".svg": "image/svg+xml", ".png": "image/png"}
 
 # config format key -> (quarto --to target, file extension, MIME type, UI label)
 _FORMAT_META: dict[str, tuple[str, str, str, str]] = {
@@ -176,6 +183,103 @@ async def _quarto_render(output_dir: Path, to: str) -> None:
         raise RuntimeError(detail[-2000:] or f"quarto exited {proc.returncode}")
 
 
+async def _render_formats(
+    output_dir: Path, formats: List[str]
+) -> Tuple[List[CreationFile], List[str], List[CreationError], List[str]]:
+    """Render ``slideshow.qmd`` (already in ``output_dir``) to each requested
+    format, best-effort. Returns ``(files, warnings, errors, rendered)``; a
+    missing Quarto binary aborts the loop, any other per-format failure is
+    recorded and the next format is tried."""
+    files: List[CreationFile] = []
+    warnings: List[str] = []
+    errors: List[CreationError] = []
+    rendered: List[str] = []
+    for fmt in formats:
+        to, ext, content_type, label = _FORMAT_META[fmt]
+        out_name = f"{_QMD_STEM}.{ext}"
+        try:
+            await _quarto_render(output_dir, to)
+            if not (output_dir / out_name).exists():
+                raise RuntimeError("quarto reported success but produced no output file")
+            files.append(
+                CreationFile(filename=out_name, content_type=content_type, path=out_name, label=label)
+            )
+            rendered.append(fmt)
+        except FileNotFoundError:
+            logger.error("slideshow: 'quarto' binary not found on PATH")
+            errors.append(CreationError(phase="render", message="quarto not installed"))
+            warnings.append("Quarto is not installed on the server; cannot render the slideshow.")
+            break
+        except Exception as e:  # noqa: BLE001 - one format failing is non-fatal
+            logger.warning(f"slideshow: {fmt} render failed: {e}")
+            warnings.append(f"{label} export failed.")
+            errors.append(CreationError(phase="render", message=f"{fmt}: {e}"))
+    return files, warnings, errors, rendered
+
+
+def _source_file() -> CreationFile:
+    return CreationFile(
+        filename=_QMD_NAME, content_type="text/markdown", path=_QMD_NAME, role="source", label="Source"
+    )
+
+
+def _asset_file(rel_path: str) -> CreationFile:
+    return CreationFile(
+        filename=Path(rel_path).name,
+        content_type=_ASSET_TYPES[Path(rel_path).suffix],
+        path=rel_path,
+        role="asset",
+    )
+
+
+def _asset_files_on_disk(output_dir: Path) -> List[CreationFile]:
+    """Re-declare every pre-rendered visual under ``assets/`` so the host keeps
+    them across re-renders (the .qmd references them by relative path)."""
+    assets_dir = output_dir / _ASSETS_DIR
+    if not assets_dir.is_dir():
+        return []
+    return [
+        _asset_file(f"{_ASSETS_DIR}/{p.name}")
+        for p in sorted(assets_dir.iterdir())
+        if p.is_file() and p.suffix in _ASSET_TYPES
+    ]
+
+
+def _write_sources(output_dir: Path, sources: List[SourceDoc]) -> None:
+    """Materialise the source docs into ``output_dir``. The host does this before
+    calling ``render``, but we never rely on it. Paths must stay inside the dir."""
+    root = output_dir.resolve()
+    for doc in sources:
+        target = (output_dir / doc.filename).resolve()
+        if root not in target.parents:
+            logger.warning(f"slideshow: ignoring source outside output_dir: {doc.filename!r}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(doc.content, encoding="utf-8")
+
+
+_FM_TITLE_RE = re.compile(r"^title:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _front_matter_title(qmd: str) -> str | None:
+    """Pull ``title:`` out of the YAML front matter (we wrote it as a JSON string,
+    but tolerate a bare or single-quoted edit)."""
+    if not qmd.startswith("---"):
+        return None
+    end = qmd.find("\n---", 3)
+    if end < 0:
+        return None
+    m = _FM_TITLE_RE.search(qmd[3:end])
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError:
+        val = raw.strip("'\"")
+    return val.strip() if isinstance(val, str) and val.strip() else None
+
+
 def _build_front_matter(title: str, subtitle: str | None, theme: str) -> str:
     lines = ["---", f"title: {json.dumps(title)}"]
     if subtitle:
@@ -260,6 +364,7 @@ class SlideshowCreator(BaseCreator):
                 )
             ],
             icon="presentation",
+            editable_source=True,
             suggestion_hint=(
                 "the narrative arc across the deck, what each section should cover, "
                 "and which points deserve their own slide"
@@ -333,9 +438,10 @@ class SlideshowCreator(BaseCreator):
 
         # --- Phase C: pre-render data slides to static SVG/PNG via the Node sidecar. ---
         output_dir = Path(request.output_dir)
+        asset_files: List[CreationFile] = []
         data_idx = [i for i, s in enumerate(slides) if s["type"] in ("chart", "infographic")]
         if data_idx:
-            assets = output_dir / "assets"
+            assets = output_dir / _ASSETS_DIR
             assets.mkdir(exist_ok=True)
             try:
                 results = await _render_specs(
@@ -359,13 +465,15 @@ class SlideshowCreator(BaseCreator):
                     if results is not None:
                         warnings.append("A data slide failed to render and was shown as text.")
                     continue
-                svg_name = f"assets/slide-{i}.svg"
+                svg_name = f"{_ASSETS_DIR}/slide-{i}.svg"
                 (output_dir / svg_name).write_text(res["svg"], encoding="utf-8")
                 slides[i]["svg_path"] = svg_name
+                asset_files.append(_asset_file(svg_name))
                 if res.get("png_b64"):
-                    png_name = f"assets/slide-{i}.png"
+                    png_name = f"{_ASSETS_DIR}/slide-{i}.png"
                     (output_dir / png_name).write_bytes(base64.b64decode(res["png_b64"]))
                     slides[i]["png_path"] = png_name
+                    asset_files.append(_asset_file(png_name))
 
         # --- Phase D: assemble the single reveal.js .qmd. ---
         parts = [_build_front_matter(deck_title, subtitle, cfg.theme), ""]
@@ -377,28 +485,9 @@ class SlideshowCreator(BaseCreator):
         (output_dir / _QMD_NAME).write_text("\n".join(parts), encoding="utf-8")
 
         # --- Phase E: render each requested format (best-effort). ---
-        files: List[CreationFile] = []
-        rendered: List[str] = []
-        for fmt in cfg.formats:
-            to, ext, content_type, label = _FORMAT_META[fmt]
-            out_name = f"{_QMD_STEM}.{ext}"
-            try:
-                await _quarto_render(output_dir, to)
-                if not (output_dir / out_name).exists():
-                    raise RuntimeError("quarto reported success but produced no output file")
-                files.append(
-                    CreationFile(filename=out_name, content_type=content_type, path=out_name, label=label)
-                )
-                rendered.append(fmt)
-            except FileNotFoundError:
-                logger.error("slideshow: 'quarto' binary not found on PATH")
-                errors.append(CreationError(phase="render", message="quarto not installed"))
-                warnings.append("Quarto is not installed on the server; cannot render the slideshow.")
-                break
-            except Exception as e:  # noqa: BLE001 - one format failing is non-fatal
-                logger.warning(f"slideshow: {fmt} render failed: {e}")
-                warnings.append(f"{label} export failed.")
-                errors.append(CreationError(phase="render", message=f"{fmt}: {e}"))
+        files, render_warnings, render_errors, rendered = await _render_formats(output_dir, cfg.formats)
+        warnings += render_warnings
+        errors += render_errors
 
         if not rendered:
             return CreationResult(
@@ -411,6 +500,10 @@ class SlideshowCreator(BaseCreator):
             )
 
         files.sort(key=lambda f: 0 if f.content_type == "text/html" else 1)
+        # The editable source and the visuals it references stay with the artifact
+        # so the host can offer "edit source -> render()" later.
+        files.append(_source_file())
+        files += asset_files
 
         data = SlideshowV1(
             title=deck_title,
@@ -419,6 +512,57 @@ class SlideshowCreator(BaseCreator):
             slides=[{"type": s["type"], "title": s.get("title") or None} for s in slides],
             formats=rendered,
         ).model_dump()
+
+        return CreationResult(
+            status="PARTIAL" if errors else "SUCCESS",
+            schema_id="slideshow.v1",
+            data=data,
+            files=files,
+            warnings=warnings,
+            errors=errors,
+        )
+
+    async def render(self, request: RenderRequest) -> CreationResult:
+        """Re-render the deck from a (user-edited) ``slideshow.qmd``. Deterministic:
+        Quarto only, no LLM and no sidecar — the pre-rendered visuals are restored
+        by the host as ``asset`` files and re-declared here as found on disk."""
+        cfg = SlideshowConfig.model_validate(request.config)
+        output_dir = Path(request.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        qmd_doc = next((d for d in request.sources if d.filename == _QMD_NAME), None)
+        if qmd_doc is None:
+            return CreationResult(
+                status="FAILURE",
+                schema_id="slideshow.v1",
+                data={},
+                errors=[CreationError(phase="setup", message=f"missing source {_QMD_NAME!r}")],
+                user_message="The slideshow source (slideshow.qmd) is missing; nothing to render.",
+            )
+        _write_sources(output_dir, request.sources)
+
+        files, warnings, errors, rendered = await _render_formats(output_dir, cfg.formats)
+        if not rendered:
+            return CreationResult(
+                status="FAILURE",
+                schema_id="slideshow.v1",
+                data={},
+                warnings=warnings,
+                errors=errors or [CreationError(phase="render", message="no formats rendered")],
+                user_message="The slideshow could not be rendered to any format.",
+            )
+
+        files.sort(key=lambda f: 0 if f.content_type == "text/html" else 1)
+        files.append(_source_file())
+        files += _asset_files_on_disk(output_dir)
+
+        # Carry the previous metadata forward; the source only encodes the title
+        # (front matter) and, implicitly, what rendered.
+        data = {"theme": cfg.theme, **request.data, "formats": rendered}
+        title = _front_matter_title(qmd_doc.content)
+        if title:
+            data["title"] = title
+        data = SlideshowV1.model_validate(data).model_dump()
 
         return CreationResult(
             status="PARTIAL" if errors else "SUCCESS",
