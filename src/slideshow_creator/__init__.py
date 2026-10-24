@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 
 from .sanitize import sanitize_markdown
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _PKG_DIR = Path(__file__).resolve().parent
 _PROMPTS_DIR = _PKG_DIR / "prompts"
@@ -52,7 +52,12 @@ _ASSET_TYPES: dict[str, str] = {".svg": "image/svg+xml", ".png": "image/png"}
 # config format key -> (quarto --to target, file extension, MIME type, UI label)
 _FORMAT_META: dict[str, tuple[str, str, str, str]] = {
     "html": ("revealjs", "html", "text/html", "HTML"),
-    "pptx": ("pptx", "pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation", "PowerPoint"),
+    "pptx": (
+        "pptx",
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "PowerPoint",
+    ),
     "pdf": ("beamer", "pdf", "application/pdf", "PDF"),
 }
 
@@ -68,13 +73,30 @@ _SLIDE_TYPES = {"title", "section", "bullets", "image_text", "chart", "infograph
 class SlideshowConfig(BaseModel):
     """Per-generation config; its JSON Schema drives the host's generate form."""
 
-    num_slides: int = Field(default=12, ge=3, le=40, description="Approximate number of slides")
+    num_slides: int = Field(
+        default=12, ge=3, le=40, description="Approximate number of slides"
+    )
     theme: Literal[
         "auto", "light", "dark", "serif", "moon", "solarized", "night", "league"
     ] = Field(default="auto", description="reveal.js deck theme")
     formats: List[Literal["html", "pptx", "pdf"]] = Field(
         default=["html", "pptx", "pdf"], description="Output formats to render"
     )
+
+
+def _response_text(response) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    raise ValueError("The model returned no text content")
 
 
 def _strip_fences(text: str) -> str:
@@ -115,7 +137,9 @@ def _normalize_slide(raw: object) -> dict | None:
     stype = raw.get("type")
     if stype not in _SLIDE_TYPES:
         return None
-    title = (raw.get("title") or "").strip() if isinstance(raw.get("title"), str) else ""
+    title = (
+        (raw.get("title") or "").strip() if isinstance(raw.get("title"), str) else ""
+    )
     if stype in ("title", "section") and not title:
         return None
     slide: dict = {"type": stype, "title": title}
@@ -158,7 +182,9 @@ async def _render_specs(specs: List[str], antv_theme: str) -> List[dict]:
         stderr=asyncio.subprocess.PIPE,
     )
     payload = json.dumps({"theme": antv_theme, "specs": specs}).encode()
-    out, err = await asyncio.wait_for(proc.communicate(payload), timeout=_SIDECAR_TIMEOUT_S)
+    out, err = await asyncio.wait_for(
+        proc.communicate(payload), timeout=_SIDECAR_TIMEOUT_S
+    )
     if proc.returncode != 0:
         detail = (err.decode(errors="replace") or "").strip()
         raise RuntimeError(detail[-2000:] or f"node sidecar exited {proc.returncode}")
@@ -200,15 +226,24 @@ async def _render_formats(
         try:
             await _quarto_render(output_dir, to)
             if not (output_dir / out_name).exists():
-                raise RuntimeError("quarto reported success but produced no output file")
+                raise RuntimeError(
+                    "quarto reported success but produced no output file"
+                )
             files.append(
-                CreationFile(filename=out_name, content_type=content_type, path=out_name, label=label)
+                CreationFile(
+                    filename=out_name,
+                    content_type=content_type,
+                    path=out_name,
+                    label=label,
+                )
             )
             rendered.append(fmt)
         except FileNotFoundError:
             logger.error("slideshow: 'quarto' binary not found on PATH")
             errors.append(CreationError(phase="render", message="quarto not installed"))
-            warnings.append("Quarto is not installed on the server; cannot render the slideshow.")
+            warnings.append(
+                "Quarto is not installed on the server; cannot render the slideshow."
+            )
             break
         except Exception as e:  # noqa: BLE001 - one format failing is non-fatal
             logger.warning(f"slideshow: {fmt} render failed: {e}")
@@ -219,7 +254,11 @@ async def _render_formats(
 
 def _source_file() -> CreationFile:
     return CreationFile(
-        filename=_QMD_NAME, content_type="text/markdown", path=_QMD_NAME, role="source", label="Source"
+        filename=_QMD_NAME,
+        content_type="text/markdown",
+        path=_QMD_NAME,
+        role="source",
+        label="Source",
     )
 
 
@@ -252,7 +291,9 @@ def _write_sources(output_dir: Path, sources: List[SourceDoc]) -> None:
     for doc in sources:
         target = (output_dir / doc.filename).resolve()
         if root not in target.parents:
-            logger.warning(f"slideshow: ignoring source outside output_dir: {doc.filename!r}")
+            logger.warning(
+                f"slideshow: ignoring source outside output_dir: {doc.filename!r}"
+            )
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(doc.content, encoding="utf-8")
@@ -338,8 +379,16 @@ def _slide_to_md(slide: dict, deck_title: str) -> str:
     svg = slide.get("svg_path")
     png = slide.get("png_path") or svg
     out = [f"## {title}", ""]
-    out += ['::: {.content-visible when-format="revealjs"}', f"![{cap}]({svg}){{fig-align=\"center\"}}", ":::"]
-    out += ['::: {.content-visible unless-format="revealjs"}', f"![{cap}]({png}){{fig-align=\"center\"}}", ":::"]
+    out += [
+        '::: {.content-visible when-format="revealjs"}',
+        f'![{cap}]({svg}){{fig-align="center"}}',
+        ":::",
+    ]
+    out += [
+        '::: {.content-visible unless-format="revealjs"}',
+        f'![{cap}]({png}){{fig-align="center"}}',
+        ":::",
+    ]
     return "\n".join(out)
 
 
@@ -379,7 +428,9 @@ class SlideshowCreator(BaseCreator):
                 status="FAILURE",
                 schema_id="slideshow.v1",
                 data={},
-                errors=[CreationError(phase="setup", message="missing 'text' model role")],
+                errors=[
+                    CreationError(phase="setup", message="missing 'text' model role")
+                ],
                 user_message="No language model was provided for slideshow generation.",
             )
 
@@ -399,7 +450,7 @@ class SlideshowCreator(BaseCreator):
         )
         llm = role.create_language(structured={"type": "json"}, max_tokens=8000)
         resp = await llm.ainvoke(prompt)
-        raw = resp.content if hasattr(resp, "content") else str(resp)
+        raw = _response_text(resp)
         try:
             parsed = json.loads(_strip_fences(raw))
         except json.JSONDecodeError as e:
@@ -408,13 +459,21 @@ class SlideshowCreator(BaseCreator):
                 status="FAILURE",
                 schema_id="slideshow.v1",
                 data={},
-                errors=[CreationError(phase="parse", message=f"invalid JSON: {e}", retryable=True)],
+                errors=[
+                    CreationError(
+                        phase="parse", message=f"invalid JSON: {e}", retryable=True
+                    )
+                ],
                 user_message="The model returned an unparseable response. Please retry.",
             )
 
-        deck_title = (parsed.get("title") or "").strip() if isinstance(parsed, dict) else ""
+        deck_title = (
+            (parsed.get("title") or "").strip() if isinstance(parsed, dict) else ""
+        )
         subtitle = parsed.get("subtitle") if isinstance(parsed, dict) else None
-        subtitle = subtitle.strip() if isinstance(subtitle, str) and subtitle.strip() else None
+        subtitle = (
+            subtitle.strip() if isinstance(subtitle, str) and subtitle.strip() else None
+        )
         raw_slides = parsed.get("slides", []) if isinstance(parsed, dict) else []
 
         slides: List[dict] = []
@@ -422,24 +481,33 @@ class SlideshowCreator(BaseCreator):
             norm = _normalize_slide(raw_slide)
             if norm is not None:
                 slides.append(norm)
-            elif isinstance(raw_slide, dict) and raw_slide.get("type") in ("chart", "infographic"):
+            elif isinstance(raw_slide, dict) and raw_slide.get("type") in (
+                "chart",
+                "infographic",
+            ):
                 # invalid/missing spec — keep the slide as bullets so the deck survives
                 slides.append(_degrade(raw_slide))
-                warnings.append("A data slide had an invalid spec and was shown as text.")
+                warnings.append(
+                    "A data slide had an invalid spec and was shown as text."
+                )
 
         if not deck_title or not slides:
             return CreationResult(
                 status="FAILURE",
                 schema_id="slideshow.v1",
                 data={},
-                errors=[CreationError(phase="generate", message="no usable slides produced")],
+                errors=[
+                    CreationError(phase="generate", message="no usable slides produced")
+                ],
                 user_message="No slideshow could be generated from this content.",
             )
 
         # --- Phase C: pre-render data slides to static SVG/PNG via the Node sidecar. ---
         output_dir = Path(request.output_dir)
         asset_files: List[CreationFile] = []
-        data_idx = [i for i, s in enumerate(slides) if s["type"] in ("chart", "infographic")]
+        data_idx = [
+            i for i, s in enumerate(slides) if s["type"] in ("chart", "infographic")
+        ]
         if data_idx:
             assets = output_dir / _ASSETS_DIR
             assets.mkdir(exist_ok=True)
@@ -450,12 +518,18 @@ class SlideshowCreator(BaseCreator):
             except FileNotFoundError:
                 results = None
                 logger.error("slideshow: 'node' binary not found on PATH")
-                warnings.append("Node is not installed; data slides were shown as text.")
-                errors.append(CreationError(phase="render", message="node not installed"))
+                warnings.append(
+                    "Node is not installed; data slides were shown as text."
+                )
+                errors.append(
+                    CreationError(phase="render", message="node not installed")
+                )
             except Exception as e:  # noqa: BLE001 - sidecar failure degrades, never fatal
                 results = None
                 logger.warning(f"slideshow: sidecar failed: {e}")
-                warnings.append("Data slides could not be rendered and were shown as text.")
+                warnings.append(
+                    "Data slides could not be rendered and were shown as text."
+                )
                 errors.append(CreationError(phase="render", message=f"sidecar: {e}"))
 
             for n, i in enumerate(data_idx):
@@ -463,7 +537,9 @@ class SlideshowCreator(BaseCreator):
                 if not res or not res.get("svg"):
                     slides[i] = _degrade(slides[i])
                     if results is not None:
-                        warnings.append("A data slide failed to render and was shown as text.")
+                        warnings.append(
+                            "A data slide failed to render and was shown as text."
+                        )
                     continue
                 svg_name = f"{_ASSETS_DIR}/slide-{i}.svg"
                 (output_dir / svg_name).write_text(res["svg"], encoding="utf-8")
@@ -471,7 +547,9 @@ class SlideshowCreator(BaseCreator):
                 asset_files.append(_asset_file(svg_name))
                 if res.get("png_b64"):
                     png_name = f"{_ASSETS_DIR}/slide-{i}.png"
-                    (output_dir / png_name).write_bytes(base64.b64decode(res["png_b64"]))
+                    (output_dir / png_name).write_bytes(
+                        base64.b64decode(res["png_b64"])
+                    )
                     slides[i]["png_path"] = png_name
                     asset_files.append(_asset_file(png_name))
 
@@ -485,7 +563,9 @@ class SlideshowCreator(BaseCreator):
         (output_dir / _QMD_NAME).write_text("\n".join(parts), encoding="utf-8")
 
         # --- Phase E: render each requested format (best-effort). ---
-        files, render_warnings, render_errors, rendered = await _render_formats(output_dir, cfg.formats)
+        files, render_warnings, render_errors, rendered = await _render_formats(
+            output_dir, cfg.formats
+        )
         warnings += render_warnings
         errors += render_errors
 
@@ -495,7 +575,8 @@ class SlideshowCreator(BaseCreator):
                 schema_id="slideshow.v1",
                 data={},
                 warnings=warnings,
-                errors=errors or [CreationError(phase="render", message="no formats rendered")],
+                errors=errors
+                or [CreationError(phase="render", message="no formats rendered")],
                 user_message="The slideshow could not be rendered to any format.",
             )
 
@@ -509,7 +590,9 @@ class SlideshowCreator(BaseCreator):
             title=deck_title,
             subtitle=subtitle,
             theme=cfg.theme,
-            slides=[{"type": s["type"], "title": s.get("title") or None} for s in slides],
+            slides=[
+                {"type": s["type"], "title": s.get("title") or None} for s in slides
+            ],
             formats=rendered,
         ).model_dump()
 
@@ -536,19 +619,26 @@ class SlideshowCreator(BaseCreator):
                 status="FAILURE",
                 schema_id="slideshow.v1",
                 data={},
-                errors=[CreationError(phase="setup", message=f"missing source {_QMD_NAME!r}")],
+                errors=[
+                    CreationError(
+                        phase="setup", message=f"missing source {_QMD_NAME!r}"
+                    )
+                ],
                 user_message="The slideshow source (slideshow.qmd) is missing; nothing to render.",
             )
         _write_sources(output_dir, request.sources)
 
-        files, warnings, errors, rendered = await _render_formats(output_dir, cfg.formats)
+        files, warnings, errors, rendered = await _render_formats(
+            output_dir, cfg.formats
+        )
         if not rendered:
             return CreationResult(
                 status="FAILURE",
                 schema_id="slideshow.v1",
                 data={},
                 warnings=warnings,
-                errors=errors or [CreationError(phase="render", message="no formats rendered")],
+                errors=errors
+                or [CreationError(phase="render", message="no formats rendered")],
                 user_message="The slideshow could not be rendered to any format.",
             )
 
