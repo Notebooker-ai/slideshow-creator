@@ -1,11 +1,8 @@
-"""slideshow-creator: an Open Notebook creator that turns notebook content into a
-**slide deck**, rendered by Quarto from a single reveal.js source to self-contained
-HTML plus downloadable PPTX and PDF (emitted as ``slideshow.v1``).
+"""Branded Remotion slide decks with video, navigable slides and static exports.
 
-The LLM designs a sequence of typed slides (title / section / bullets / image_text /
-chart / infographic). Data slides carry an AntV Infographic DSL ``spec``; a small Node
-sidecar pre-renders each to a static SVG (and PNG via sharp) so the visuals appear in
-PPTX/PDF too. PDF uses Quarto's ``beamer`` format with the ``tectonic`` engine.
+Model output is data for a trusted React composition, never executable JSX.
+AntV visuals are rendered to local images. Quarto remains the deterministic
+PDF/PowerPoint exporter and supports existing reveal.js source artifacts.
 """
 
 from __future__ import annotations
@@ -33,9 +30,11 @@ from open_notebook_creator_sdk import (
 from open_notebook_creator_sdk.schemas import SlideshowV1
 from pydantic import BaseModel, Field
 
+from .remotion import SOURCE_NAME, render_remotion
+from .remotion import source_file as _remotion_source_file
 from .sanitize import sanitize_markdown
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 _PKG_DIR = Path(__file__).resolve().parent
 _PROMPTS_DIR = _PKG_DIR / "prompts"
@@ -78,9 +77,9 @@ class SlideshowConfig(BaseModel):
     )
     theme: Literal[
         "auto", "light", "dark", "serif", "moon", "solarized", "night", "league"
-    ] = Field(default="auto", description="reveal.js deck theme")
-    formats: List[Literal["html", "pptx", "pdf"]] = Field(
-        default=["html", "pptx", "pdf"], description="Output formats to render"
+    ] = Field(default="auto", description="Slideshow color theme")
+    formats: List[Literal["html", "mp4", "pptx", "pdf"]] = Field(
+        default=["html", "mp4", "pptx", "pdf"], description="Output formats to render"
     )
 
 
@@ -401,7 +400,7 @@ class SlideshowCreator(BaseCreator):
             key="slideshows",
             name="Slideshows",
             version=__version__,
-            description="LLM-designed slide deck (reveal.js) with AntV data slides, exported to HTML/PPTX/PDF via Quarto.",
+            description="Branded Remotion slideshows with video, navigable slides, PowerPoint and PDF exports.",
             sdk_compat=">=0.2,<1",
             emits=["slideshow.v1"],
             model_roles=[
@@ -563,9 +562,41 @@ class SlideshowCreator(BaseCreator):
         (output_dir / _QMD_NAME).write_text("\n".join(parts), encoding="utf-8")
 
         # --- Phase E: render each requested format (best-effort). ---
-        files, render_warnings, render_errors, rendered = await _render_formats(
-            output_dir, cfg.formats
+        deck = {
+            "title": deck_title,
+            "subtitle": subtitle,
+            "theme": cfg.theme,
+            "slides": slides,
+        }
+        (output_dir / SOURCE_NAME).write_text(
+            json.dumps(deck, ensure_ascii=False, indent=2)
         )
+        try:
+            files, render_warnings, render_errors, rendered = await render_remotion(
+                output_dir, deck
+            )
+        except Exception as exc:
+            return CreationResult(
+                status="FAILURE",
+                schema_id="slideshow.v1",
+                data={},
+                errors=[
+                    CreationError(phase="render", message=str(exc), retryable=True)
+                ],
+                user_message="The Remotion slideshow could not be rendered.",
+            )
+        (
+            export_files,
+            export_warnings,
+            export_errors,
+            export_formats,
+        ) = await _render_formats(
+            output_dir, [fmt for fmt in cfg.formats if fmt in ("pptx", "pdf")]
+        )
+        files += export_files
+        render_warnings += export_warnings
+        render_errors += export_errors
+        rendered += export_formats
         warnings += render_warnings
         errors += render_errors
 
@@ -583,8 +614,8 @@ class SlideshowCreator(BaseCreator):
         files.sort(key=lambda f: 0 if f.content_type == "text/html" else 1)
         # The editable source and the visuals it references stay with the artifact
         # so the host can offer "edit source -> render()" later.
-        files.append(_source_file())
-        files += asset_files
+        files.append(_remotion_source_file())
+        files += _asset_files_on_disk(output_dir)
 
         data = SlideshowV1(
             title=deck_title,
@@ -612,6 +643,94 @@ class SlideshowCreator(BaseCreator):
         cfg = SlideshowConfig.model_validate(request.config)
         output_dir = Path(request.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        json_doc = next((d for d in request.sources if d.filename == SOURCE_NAME), None)
+        if json_doc:
+            _write_sources(output_dir, request.sources)
+            try:
+                deck = json.loads(json_doc.content)
+                if not isinstance(deck, dict) or not isinstance(
+                    deck.get("slides"), list
+                ):
+                    raise ValueError("Invalid slideshow source")
+                slides = [_normalize_slide(slide) for slide in deck["slides"]]
+                if (
+                    not deck.get("title")
+                    or not slides
+                    or any(slide is None for slide in slides)
+                ):
+                    raise ValueError("The source must contain a title and valid slides")
+                # Rebuild visuals from the edited source, never reuse stale chart images.
+                data_slides = [
+                    slide
+                    for slide in slides
+                    if slide["type"] in ("chart", "infographic")
+                ]
+                if data_slides:
+                    visuals = await _render_specs(
+                        [slide["spec"] for slide in data_slides],
+                        _antv_theme_for(deck.get("theme", cfg.theme)),
+                    )
+                    (output_dir / _ASSETS_DIR).mkdir(exist_ok=True)
+                    for index, (slide, visual) in enumerate(zip(data_slides, visuals)):
+                        if visual.get("error") or not visual.get("svg"):
+                            raise ValueError("A slide visual could not be rendered")
+                        relative = f"assets/edited-{index}.svg"
+                        (output_dir / relative).write_text(visual["svg"])
+                        slide["svg_path"] = relative
+                        if visual.get("png_b64"):
+                            png = f"assets/edited-{index}.png"
+                            (output_dir / png).write_bytes(
+                                base64.b64decode(visual["png_b64"])
+                            )
+                            slide["png_path"] = png
+                deck["slides"] = slides
+                parts = [
+                    _build_front_matter(
+                        deck["title"],
+                        deck.get("subtitle"),
+                        deck.get("theme", cfg.theme),
+                    ),
+                    "",
+                ]
+                parts.extend(_slide_to_md(slide, deck["title"]) for slide in slides)
+                (output_dir / _QMD_NAME).write_text("\n\n".join(parts))
+                files, warnings, errors, rendered = await render_remotion(
+                    output_dir, deck
+                )
+                extra, warn, errs, formats = await _render_formats(
+                    output_dir, [fmt for fmt in cfg.formats if fmt in ("pptx", "pdf")]
+                )
+                files += extra
+                warnings += warn
+                errors += errs
+                rendered += formats
+                files += [_remotion_source_file()] + _asset_files_on_disk(output_dir)
+                data = SlideshowV1(
+                    title=deck["title"],
+                    subtitle=deck.get("subtitle"),
+                    theme=deck.get("theme", cfg.theme),
+                    slides=[
+                        {"type": slide["type"], "title": slide.get("title")}
+                        for slide in slides
+                    ],
+                    formats=rendered,
+                ).model_dump()
+                return CreationResult(
+                    status="PARTIAL" if errors else "SUCCESS",
+                    schema_id="slideshow.v1",
+                    data=data,
+                    files=files,
+                    warnings=warnings,
+                    errors=errors,
+                )
+            except Exception as exc:
+                return CreationResult(
+                    status="FAILURE",
+                    schema_id="slideshow.v1",
+                    errors=[CreationError(phase="render", message=str(exc))],
+                    user_message="The edited slideshow could not be rendered.",
+                )
 
         qmd_doc = next((d for d in request.sources if d.filename == _QMD_NAME), None)
         if qmd_doc is None:

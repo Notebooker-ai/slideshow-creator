@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import slideshow_creator
 from open_notebook_creator_sdk import (
     ContentBundle,
     CreationRequest,
@@ -20,13 +21,15 @@ from open_notebook_creator_sdk import (
     SourceDoc,
 )
 from open_notebook_creator_sdk.testing import assert_result_compliant
-
-import slideshow_creator
 from slideshow_creator import SlideshowCreator
 
-_VALID_CHART = "infographic chart-column-simple\ndata\n  values\n    - label A\n      value 1"
+_VALID_CHART = (
+    "infographic chart-column-simple\ndata\n  values\n    - label A\n      value 1"
+)
 _FAKE_SVG = '<svg xmlns="http://www.w3.org/2000/svg"><text>fake</text></svg>'
-_FAKE_PNG_B64 = "iVBORw0KGgo="  # any base64 payload; nothing decodes it as an image here
+_FAKE_PNG_B64 = (
+    "iVBORw0KGgo="  # any base64 payload; nothing decodes it as an image here
+)
 
 _EXT = {"revealjs": "html", "pptx": "pptx", "beamer": "pdf"}
 
@@ -47,7 +50,9 @@ class _FakeRole(ModelRole):
 
 
 def _gen_request(output_dir: str, slides, formats=None) -> CreationRequest:
-    payload = json.dumps({"title": "My Deck", "subtitle": "A subtitle", "slides": slides})
+    payload = json.dumps(
+        {"title": "My Deck", "subtitle": "A subtitle", "slides": slides}
+    )
     return CreationRequest(
         content=ContentBundle(text="Some research content.", token_count=4),
         config={"num_slides": 8, "theme": "auto", "formats": formats or ["html"]},
@@ -66,7 +71,9 @@ def stub_toolchain(monkeypatch):
     async def fake_quarto(output_dir: Path, to: str) -> None:
         qmd = (output_dir / "slideshow.qmd").read_text(encoding="utf-8")
         calls.append((to, qmd))
-        (output_dir / f"slideshow.{_EXT[to]}").write_text(f"<rendered:{to}>\n{qmd}", encoding="utf-8")
+        (output_dir / f"slideshow.{_EXT[to]}").write_text(
+            f"<rendered:{to}>\n{qmd}", encoding="utf-8"
+        )
 
     async def fake_specs(specs, _theme):
         return [{"svg": _FAKE_SVG, "png_b64": _FAKE_PNG_B64} for _ in specs]
@@ -89,7 +96,12 @@ async def test_generate_attaches_source_and_assets(stub_toolchain):
     slides = [
         {"type": "title", "title": "My Deck"},
         {"type": "bullets", "title": "Points", "bullets": ["One", "Two"]},
-        {"type": "chart", "title": "Numbers", "caption": "the data", "spec": _VALID_CHART},
+        {
+            "type": "chart",
+            "title": "Numbers",
+            "caption": "the data",
+            "spec": _VALID_CHART,
+        },
     ]
     with tempfile.TemporaryDirectory() as d:
         creator = SlideshowCreator()
@@ -98,14 +110,21 @@ async def test_generate_attaches_source_and_assets(stub_toolchain):
         assert_result_compliant(creator, result)
 
         outputs = _by_role(result.files, "output")
-        assert [f.filename for f in outputs] == ["slideshow.html", "slideshow.pdf"]
+        assert [f.filename for f in outputs] == [
+            "slideshow.html",
+            "slideshow.mp4",
+            "slideshow.pdf",
+        ]
         assert outputs[0].content_type == "text/html"
 
         sources = _by_role(result.files, "source")
         assert len(sources) == 1
         src = sources[0]
         assert (src.filename, src.path, src.content_type, src.label) == (
-            "slideshow.qmd", "slideshow.qmd", "text/markdown", "Source"
+            "slideshow.json",
+            "slideshow.json",
+            "application/json",
+            "Slide source",
         )
 
         assets = _by_role(result.files, "asset")
@@ -121,12 +140,17 @@ async def test_generate_attaches_source_and_assets(stub_toolchain):
 
 @pytest.mark.asyncio
 async def test_generate_without_data_slides_has_no_assets(stub_toolchain):
-    slides = [{"type": "title", "title": "My Deck"}, {"type": "section", "title": "One"}]
+    slides = [
+        {"type": "title", "title": "My Deck"},
+        {"type": "section", "title": "One"},
+    ]
     with tempfile.TemporaryDirectory() as d:
         result = await SlideshowCreator().generate(_gen_request(d, slides))
         assert result.status == "SUCCESS"
         assert _by_role(result.files, "asset") == []
-        assert [f.filename for f in _by_role(result.files, "source")] == ["slideshow.qmd"]
+        assert [f.filename for f in _by_role(result.files, "source")] == [
+            "slideshow.json"
+        ]
 
 
 @pytest.mark.asyncio
@@ -134,7 +158,12 @@ async def test_render_rerenders_from_edited_source(stub_toolchain):
     slides = [
         {"type": "title", "title": "My Deck"},
         {"type": "bullets", "title": "Points", "bullets": ["One", "Two"]},
-        {"type": "chart", "title": "Numbers", "caption": "the data", "spec": _VALID_CHART},
+        {
+            "type": "chart",
+            "title": "Numbers",
+            "caption": "the data",
+            "spec": _VALID_CHART,
+        },
     ]
     with tempfile.TemporaryDirectory() as d:
         creator = SlideshowCreator()
@@ -148,7 +177,13 @@ async def test_render_rerenders_from_edited_source(stub_toolchain):
         # into output_dir and hands us the text.
         edited = original_qmd.replace("- One", "- Uno (edited)")
         req = RenderRequest(
-            sources=[SourceDoc(filename="slideshow.qmd", content_type="text/markdown", content=edited)],
+            sources=[
+                SourceDoc(
+                    filename="slideshow.qmd",
+                    content_type="text/markdown",
+                    content=edited,
+                )
+            ],
             config={"num_slides": 8, "theme": "auto", "formats": ["html", "pptx"]},
             data=gen.data,
             output_dir=d,
@@ -161,7 +196,9 @@ async def test_render_rerenders_from_edited_source(stub_toolchain):
         # deterministic: quarto ran once per configured format, on the edited text
         assert [to for to, _ in stub_toolchain] == ["revealjs", "pptx"]
         assert all("- Uno (edited)" in qmd for _, qmd in stub_toolchain)
-        assert "- Uno (edited)" in (Path(d) / "slideshow.html").read_text(encoding="utf-8")
+        assert "- Uno (edited)" in (Path(d) / "slideshow.html").read_text(
+            encoding="utf-8"
+        )
 
         outputs = _by_role(result.files, "output")
         assert [f.filename for f in outputs] == ["slideshow.html", "slideshow.pptx"]
@@ -186,15 +223,26 @@ async def test_render_rerenders_from_edited_source(stub_toolchain):
 
 @pytest.mark.asyncio
 async def test_render_picks_up_edited_front_matter_title(stub_toolchain):
-    slides = [{"type": "title", "title": "My Deck"}, {"type": "section", "title": "One"}]
+    slides = [
+        {"type": "title", "title": "My Deck"},
+        {"type": "section", "title": "One"},
+    ]
     with tempfile.TemporaryDirectory() as d:
         creator = SlideshowCreator()
         gen = await creator.generate(_gen_request(d, slides))
-        edited = (Path(d) / "slideshow.qmd").read_text(encoding="utf-8").replace(
-            'title: "My Deck"', 'title: "Renamed Deck"'
+        edited = (
+            (Path(d) / "slideshow.qmd")
+            .read_text(encoding="utf-8")
+            .replace('title: "My Deck"', 'title: "Renamed Deck"')
         )
         req = RenderRequest(
-            sources=[SourceDoc(filename="slideshow.qmd", content_type="text/markdown", content=edited)],
+            sources=[
+                SourceDoc(
+                    filename="slideshow.qmd",
+                    content_type="text/markdown",
+                    content=edited,
+                )
+            ],
             config={"formats": ["html"]},
             data=gen.data,
             output_dir=d,
@@ -209,9 +257,15 @@ async def test_render_picks_up_edited_front_matter_title(stub_toolchain):
 async def test_render_writes_sources_even_if_host_did_not(stub_toolchain):
     """render must not rely on the host having materialised the source."""
     with tempfile.TemporaryDirectory() as d:
-        qmd = '---\ntitle: "Fresh"\nformat:\n  revealjs: default\n---\n\n## Only slide\n'
+        qmd = (
+            '---\ntitle: "Fresh"\nformat:\n  revealjs: default\n---\n\n## Only slide\n'
+        )
         req = RenderRequest(
-            sources=[SourceDoc(filename="slideshow.qmd", content_type="text/markdown", content=qmd)],
+            sources=[
+                SourceDoc(
+                    filename="slideshow.qmd", content_type="text/markdown", content=qmd
+                )
+            ],
             config={"formats": ["html"]},
             data={"title": "Fresh", "theme": "auto", "slides": [], "formats": ["html"]},
             output_dir=d,
@@ -227,7 +281,9 @@ async def test_render_writes_sources_even_if_host_did_not(stub_toolchain):
 async def test_render_without_source_is_failure(stub_toolchain):
     with tempfile.TemporaryDirectory() as d:
         req = RenderRequest(
-            sources=[SourceDoc(filename="notes.txt", content_type="text/plain", content="x")],
+            sources=[
+                SourceDoc(filename="notes.txt", content_type="text/plain", content="x")
+            ],
             config={"formats": ["html"]},
             data={"title": "T", "theme": "auto", "slides": [], "formats": ["html"]},
             output_dir=d,
@@ -248,7 +304,13 @@ async def test_render_all_formats_failing_is_failure(monkeypatch, stub_toolchain
     monkeypatch.setattr(slideshow_creator, "_quarto_render", broken_quarto)
     with tempfile.TemporaryDirectory() as d:
         req = RenderRequest(
-            sources=[SourceDoc(filename="slideshow.qmd", content_type="text/markdown", content="## x\n")],
+            sources=[
+                SourceDoc(
+                    filename="slideshow.qmd",
+                    content_type="text/markdown",
+                    content="## x\n",
+                )
+            ],
             config={"formats": ["html"]},
             data={"title": "T", "theme": "auto", "slides": [], "formats": ["html"]},
             output_dir=d,
@@ -257,3 +319,117 @@ async def test_render_all_formats_failing_is_failure(monkeypatch, stub_toolchain
         result = await SlideshowCreator().render(req)
         assert result.status == "FAILURE"
         assert result.errors and result.errors[0].phase == "render"
+
+
+@pytest.mark.asyncio
+async def test_json_source_rerenders_without_a_language_model(stub_toolchain):
+    with tempfile.TemporaryDirectory() as d:
+        source = json.dumps(
+            {
+                "title": "Edited deck",
+                "theme": "dark",
+                "slides": [
+                    {"type": "title", "title": "Edited deck"},
+                    {
+                        "type": "bullets",
+                        "title": "A new takeaway",
+                        "bullets": ["Explain the mechanism."],
+                    },
+                ],
+            }
+        )
+        result = await SlideshowCreator().render(
+            RenderRequest(
+                sources=[
+                    SourceDoc(
+                        filename="slideshow.json",
+                        content_type="application/json",
+                        content=source,
+                    )
+                ],
+                config={"formats": ["html", "mp4"]},
+                data={},
+                output_dir=d,
+                artifact_id="edited",
+            )
+        )
+        assert result.status == "SUCCESS"
+        assert result.data["title"] == "Edited deck"
+        assert result.data["formats"] == ["html", "mp4"]
+        assert result.data["slides"][1]["title"] == "A new takeaway"
+        assert [f.path for f in result.files if f.role == "source"] == [
+            "slideshow.json"
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source",
+    [
+        "not-json",
+        "{}",
+        '{"title":"x","slides":[]}',
+        '{"title":"x","slides":[{"type":"unknown"}]}',
+    ],
+)
+async def test_invalid_json_edit_is_an_explicit_failure(stub_toolchain, source):
+    with tempfile.TemporaryDirectory() as d:
+        result = await SlideshowCreator().render(
+            RenderRequest(
+                sources=[
+                    SourceDoc(
+                        filename="slideshow.json",
+                        content_type="application/json",
+                        content=source,
+                    )
+                ],
+                config={},
+                data={},
+                output_dir=d,
+                artifact_id="invalid",
+            )
+        )
+        assert result.status == "FAILURE"
+        assert result.errors[0].phase == "render"
+
+
+@pytest.mark.asyncio
+async def test_json_chart_edit_rebuilds_visuals_from_the_edited_spec(
+    monkeypatch, stub_toolchain
+):
+    calls = []
+
+    async def render_specs(specs, theme):
+        calls.extend(specs)
+        return [{"svg": _FAKE_SVG, "png_b64": _FAKE_PNG_B64}]
+
+    monkeypatch.setattr(slideshow_creator, "_render_specs", render_specs)
+    with tempfile.TemporaryDirectory() as d:
+        source = json.dumps(
+            {
+                "title": "Updated data",
+                "theme": "light",
+                "slides": [
+                    {"type": "chart", "title": "Updated chart", "spec": _VALID_CHART}
+                ],
+            }
+        )
+        result = await SlideshowCreator().render(
+            RenderRequest(
+                sources=[
+                    SourceDoc(
+                        filename="slideshow.json",
+                        content_type="application/json",
+                        content=source,
+                    )
+                ],
+                config={"formats": ["html"]},
+                data={},
+                output_dir=d,
+                artifact_id="chart",
+            )
+        )
+        assert result.status == "SUCCESS"
+        assert calls == [_VALID_CHART]
+        assert (Path(d) / "assets/edited-0.svg").exists()
+        assert (Path(d) / "assets/edited-0.png").exists()
