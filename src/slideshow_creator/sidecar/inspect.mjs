@@ -33,7 +33,9 @@ try {
     if (layout.width>1442) issues.push(`${name} overflows horizontally`);
     if (layout.height>18000) {issues.push(`${name} exceeds visual inspection height`);await page.close();continue;}
     const filename=`quality-previews/page-${i+1}.png`;
-    await page.screenshot({path:join(input.outputDir,filename),fullPage:true});
+    const content = input.artifact && name==='quality-view.html' ? await page.locator('#root').boundingBox() : null;
+    if (content && content.height>0) await page.screenshot({path:join(input.outputDir,filename),clip:{x:0,y:0,width:1440,height:Math.ceil(content.y+content.height+16)}});
+    else await page.screenshot({path:join(input.outputDir,filename),fullPage:true});
     images.push(filename);
     if (input.mobile) {
       await page.setViewportSize({width:390,height:844});

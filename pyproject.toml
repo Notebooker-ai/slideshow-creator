@@ -1,6 +1,6 @@
 [project]
 name = "slideshow-creator"
-version = "0.3.0"
+version = "0.3.1"
 license = "MIT"
 description = "Open Notebook creator: Branded Remotion slide decks and video with AntV data slides (slideshow.v1)"
 readme = "README.md"

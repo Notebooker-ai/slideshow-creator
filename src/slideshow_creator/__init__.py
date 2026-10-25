@@ -33,8 +33,9 @@ from pydantic import BaseModel, Field
 from .remotion import SOURCE_NAME, render_remotion
 from .remotion import source_file as _remotion_source_file
 from .sanitize import sanitize_markdown
+from .visual_layout import layout_safe_slide, process_bullets
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _PKG_DIR = Path(__file__).resolve().parent
 _PROMPTS_DIR = _PKG_DIR / "prompts"
@@ -160,13 +161,17 @@ def _normalize_slide(raw: object) -> dict | None:
         slide["spec"] = spec.strip()
     if stype == "bullets" and not slide.get("bullets"):
         return None
-    return slide
+    return layout_safe_slide(slide)
 
 
 def _degrade(slide: dict) -> dict:
     """Turn a data slide we couldn't render into a plain bullets slide."""
     caption = slide.get("caption") or "Visual could not be rendered."
-    return {"type": "bullets", "title": slide.get("title") or "", "bullets": [caption]}
+    return {
+        "type": "bullets", "title": slide.get("title") or "",
+        "bullets": process_bullets(slide.get("spec", "")) or [caption],
+        **{k: slide[k] for k in ("caption", "notes") if k in slide},
+    }
 
 
 async def _render_specs(specs: List[str], antv_theme: str) -> List[dict]:
@@ -187,7 +192,7 @@ async def _render_specs(specs: List[str], antv_theme: str) -> List[dict]:
     if proc.returncode != 0:
         detail = (err.decode(errors="replace") or "").strip()
         raise RuntimeError(detail[-2000:] or f"node sidecar exited {proc.returncode}")
-    return json.loads(out)
+    return json.loads(out.decode().rsplit("NOTEBOOKER_RESULT:", 1)[-1])
 
 
 async def _quarto_render(output_dir: Path, to: str) -> None:

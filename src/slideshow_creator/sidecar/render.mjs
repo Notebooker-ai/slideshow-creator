@@ -10,6 +10,9 @@
 
 import { renderToString } from '@antv/infographic/ssr'
 import sharp from 'sharp'
+import {chromium} from 'playwright'
+import {ensureBrowser} from '@remotion/renderer'
+import {inspectSvg} from './layout.mjs'
 
 async function main() {
   const chunks = []
@@ -25,9 +28,19 @@ async function main() {
   const specs = Array.isArray(input.specs) ? input.specs : []
 
   const out = []
+  const executablePath = process.env.REMOTION_BROWSER_EXECUTABLE || (await ensureBrowser()).path
+  const browser = await chromium.launch({executablePath, headless:true, args:['--no-sandbox']})
+  const page = await browser.newPage({viewport:{width:1920,height:1080}})
+  await page.route('**/*', route=>route.abort())
+  try {
   for (const spec of specs) {
     try {
       const svg = await renderToString(spec, { theme })
+      const collisions = await inspectSvg(page, svg)
+      if (collisions.length) {
+        out.push({svg:null,png_b64:null,error:collisions.slice(0,5).join('; ')})
+        continue
+      }
       let png_b64 = null
       let error = null
       try {
@@ -41,7 +54,8 @@ async function main() {
       out.push({ svg: null, png_b64: null, error: String(e && e.message ? e.message : e) })
     }
   }
-  process.stdout.write(JSON.stringify(out))
+  } finally { await browser.close() }
+  process.stdout.write('\nNOTEBOOKER_RESULT:'+JSON.stringify(out))
 }
 
 main().catch(e => {
